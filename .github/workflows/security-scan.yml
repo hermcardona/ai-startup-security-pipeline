@@ -1,0 +1,120 @@
+name: security-scan
+
+on:
+  pull_request:
+    branches: [ "main" ]
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  sast:
+    name: SAST + Dependency Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install scanners
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit semgrep pylint safety
+
+      - name: Create report directory
+        run: mkdir -p security-reports
+
+      - name: Run Bandit (security linter)
+        run: |
+          bandit -r src -f json -o security-reports/bandit-results.json
+
+      - name: Run Semgrep (pattern-based SAST)
+        run: |
+          semgrep --config=auto src --json -o security-reports/semgrep-results.json
+
+      - name: Run PyLint (W/E only)
+        run: |
+          pylint src/*.py --disable=all --enable=W,E > security-reports/pylint-results.txt || true
+
+      - name: Run Safety (dependency vulnerabilities)
+        run: |
+          safety check --json > security-reports/safety-results.json || true
+
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: security-reports/
+
+      # STRICT INVESTOR GATE:
+      # Fail if:
+      #  1) Bandit finds any MEDIUM/HIGH
+      #  2) Bandit finds hardcoded credentials (B105/B106)
+      #  3) Semgrep finds any pickle deserialization rule hits
+      - name: Enforce policy (fail on investor-critical issues)
+        run: |
+          python - <<'PY'
+          import json, sys, re
+
+          def load(path):
+            with open(path, "r", encoding="utf-8") as f:
+              return json.load(f)
+
+          bandit = load("security-reports/bandit-results.json")
+          b_results = bandit.get("results", [])
+
+          # Bandit policy: block on any MEDIUM/HIGH
+          med_high = [x for x in b_results if x.get("issue_severity") in ("MEDIUM", "HIGH")]
+
+          # Bandit policy: also explicitly block hardcoded creds (B105/B106)
+          hardcoded = [x for x in b_results if x.get("test_id") in ("B105", "B106")]
+
+          semgrep = load("security-reports/semgrep-results.json")
+          s_results = semgrep.get("results", [])
+
+          # Semgrep policy: block pickle rule hits (deserialization)
+          # Matches your finding: python.lang.security.deserialization.pickle.avoid-pickle
+          pickle_hits = [x for x in s_results if "pickle.avoid-pickle" in (x.get("check_id") or "")]
+
+          def brief(item, kind=""):
+            if kind == "bandit":
+              return f"{item.get('issue_severity')} {item.get('test_id')} {item.get('filename')}:{item.get('line_number')} - {item.get('issue_text')}"
+            if kind == "semgrep":
+              start = (item.get("start") or {}).get("line")
+              msg = ((item.get("extra") or {}).get("message") or "").strip().replace("\n"," ")
+              return f"{item.get('check_id')} {item.get('path')}:{start} - {msg}"
+            return str(item)
+
+          failed = False
+
+          if med_high:
+            failed = True
+            print("\n[FAIL] Bandit MEDIUM/HIGH findings:")
+            for x in med_high:
+              print("  -", brief(x, "bandit"))
+
+          if hardcoded:
+            failed = True
+            print("\n[FAIL] Bandit hardcoded credential findings (B105/B106):")
+            for x in hardcoded:
+              print("  -", brief(x, "bandit"))
+
+          if pickle_hits:
+            failed = True
+            print("\n[FAIL] Semgrep pickle deserialization findings:")
+            for x in pickle_hits:
+              print("  -", brief(x, "semgrep"))
+
+          if failed:
+            print("\nBlocking PR/push due to investor-critical security policy violations.")
+            sys.exit(1)
+
+          print("OK: No investor-critical findings detected.")
+          PY
