@@ -1,0 +1,10 @@
+# Python virtual environment
+venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Security scan outputs (CI artifacts only)
+security-reports/*.json
+security-reports/*.txt
